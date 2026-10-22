@@ -100,7 +100,9 @@ a nested mutation language into downstream storage protocols.
   Replacing a complete JSON array value may change that selected array's length.
 - Preserve the existing Milvus nullability boundary: target parent rows and
   typed-Array replacement values must be non-null. JSON replacements can be
-  JSON `null`, but not database NULL.
+  JSON `null`, but not database NULL. A Struct child declared
+  `element_nullable` follows its own element nullability; see
+  [Element-nullable Struct children](#element-nullable-struct-children).
 - Define one path grammar and equivalent failure semantics for the server,
   REST v2, and every SDK that exposes the feature. Current REST JSON
   validation exceptions are recorded under
@@ -115,7 +117,8 @@ a nested mutation language into downstream storage protocols.
 - Inserting, deleting, moving, sorting, or otherwise reordering an array
   position.
 - Nested `ARRAY_APPEND` or `ARRAY_REMOVE`.
-- Directly replacing a nested Array child of an `Array<Struct>` element.
+- Directly replacing a nested Array child of an `Array<Struct>` element, unless
+  the child is `element_nullable`.
 - Multiple base paths for the same parent field in one request.
 - Wildcards, predicates, slices, negative indexes, or column-wide child paths
   such as `[age]`.
@@ -125,7 +128,8 @@ a nested mutation language into downstream storage protocols.
 - Adding element-level nullability to `Array`, `ArrayOfVector`, or
   `Array<Struct>` children.
 - Replacing an Array element, a Struct child, or a complete Struct element with
-  `null`.
+  `null`. An element of an `element_nullable` Struct child can be replaced
+  with a null element.
 - Adding a generic JSONPath or field-expression language.
 - Positional updates to dynamic JSON (`$meta`), automatic creation of JSON
   intermediate containers, or automatic JSON array expansion.
@@ -311,13 +315,14 @@ The protobuf-level shapes are:
 | Scalar `Array[index]` | `type = Array`, one `ArrayArray.data` row per entity | One immediate scalar element |
 | Struct scalar child | `ArrayOfStruct` with one scalar child | Singleton scalar Array row |
 | Struct vector child | `ArrayOfStruct` with one vector child | Singleton ArrayOfVector row |
-| Struct element `[index]` | `ArrayOfStruct` with all schema children | One element in every child row |
+| Struct element `[index]` | `ArrayOfStruct` with every schema child that is not `element_nullable` | One element in every child row |
 | Explicit JSON path | `type = JSON`, one `JSONArray.data` entry per entity | Encoded JSON value, including JSON `null` |
 
 Every immediate typed-Array replacement element must carry one concrete,
-non-null value. `PATH_REPLACE` does not introduce or interpret element-level
-`valid_data`; an operand carrying immediate-element validity metadata is
-rejected. Field-level validity remains governed by the existing parent-field
+non-null value. `PATH_REPLACE` does not introduce element-level `valid_data`;
+an operand carrying immediate-element validity metadata is rejected, except on
+a Struct child declared `element_nullable`, whose operand uses the compact
+insert layout with element validity. Field-level validity remains governed by the existing parent-field
 contract, and every operand parent row must be present and not database NULL.
 The JSON literal `null` is a present JSON value, not a null parent row.
 
@@ -366,16 +371,19 @@ field_ops = {
 ```
 
 For a schema containing `age`, `city`, and `score`, this request replaces the
-complete element at index 1. Omitting any child is rejected; old values and
-schema defaults do not fill missing replacement children. Every child must
-carry one concrete, non-null value in every request row.
+complete element at index 1. Omitting a child that is not `element_nullable`
+is rejected; old values and schema defaults do not fill missing replacement
+children. Such a child must carry one concrete, non-null value in every
+request row. An omitted `element_nullable` child becomes a null element at
+index 1; see
+[Element-nullable Struct children](#element-nullable-struct-children).
 
 `[index]` with only `{age: value}` is invalid for this schema, while
 `[index][age]` with that operand updates only `age`. Updating several but not
 all children requires separate requests. The SDK must not split automatically.
 If a schema includes an unsupported replacement child type, such as a nested
-Array, whole-element replacement is rejected; supported single-child paths
-can still preserve that non-target child.
+Array that is not `element_nullable`, whole-element replacement is rejected;
+supported single-child paths can still preserve that non-target child.
 
 ### SDK and REST v2 shape
 
@@ -524,8 +532,9 @@ values still pass the existing type, dimension, capacity, and length checks.
   if other fields use ordinary replacement.
 - Every `PATH_REPLACE` parent and operand row must be present and not database
   NULL. JSON literal `null` is a present value, not a false field-validity entry.
-  This feature does not extend typed-Array or Struct element nullability;
-  `element_nullable` does not relax the non-null replacement requirement.
+  This feature does not extend typed-Array or Struct element nullability. A
+  Struct child declared `element_nullable` accepts a null element; see
+  [Element-nullable Struct children](#element-nullable-struct-children).
 - Each array index must satisfy `0 <= index < oldArrayLength` independently
   for every entity. Indexing never appends, pads, or resizes an array. Replacing
   a selected complete JSON array is different: the new array may have another
@@ -533,6 +542,37 @@ values still pass the existing type, dimension, capacity, and length checks.
 - All request rows must pass deterministic validation before write dispatch.
   The SDK must not automatically split unsupported combinations into multiple
   requests; separate calls are explicit application actions.
+
+### Element-nullable Struct children
+
+A Struct child declared `element_nullable` (see
+[Array Element-Level Null](./20260709-element-level-null.md)) follows its
+element nullability under `PATH_REPLACE`:
+
+- `[index][child]` on such a child replaces the element at `index` with the
+  operand's single element, which may be a null element. The operand row
+  uses the compact insert layout: one element-validity flag, and a payload
+  only for a non-null element.
+- `[index]` may omit such a child. Proxy fills the omitted child with one
+  null element per operand row, so the element at `index` becomes null in
+  that child; the old value is not kept. A supplied child may carry a null
+  element. A child that is not `element_nullable` must still be supplied with
+  a non-null value.
+- A nested `Array<Array<T>>` child that is `element_nullable` can be the
+  target of `[index][child]` and take part in `[index]`; its operand is one
+  inner array or a null inner array.
+- The old row keeps its null elements: Proxy converts the queried children,
+  which come back dense, to the compact insert layout before it replaces the
+  element, and the elements and children the path does not select keep their
+  values and validity.
+- A child name the Struct does not have, such as a dropped child, is
+  rejected.
+- REST v2 follows the same rule. An `[index]` operand must name every child
+  that is not `element_nullable` and may omit an `element_nullable` child:
+  REST leaves the omitted child out of the request, and Proxy fills a null
+  element for it as above. A JSON `null` for an `element_nullable` child is a
+  null element. A key that names no child, such as a dropped child, is
+  rejected, and the `[index][child]` rules are unchanged.
 
 ### Unsupported operations and rejected inputs
 
@@ -542,14 +582,14 @@ listed [separately below](#current-implementation-differences-and-limitations).
 | Scenario | Behavior and reason | Supported alternative |
 |---|---|---|
 | Scalar Array operand is a naked scalar, empty array, or multiple elements | Reject; each operand row must contain exactly one replacement element | Supply `[value]` for one existing index |
-| Struct `[index]` operand omits any schema child | Reject; complete replacement never inherits old children or fills defaults | Supply every child, or use `[index][child]` for one child |
+| Struct `[index]` operand omits a schema child that is not `element_nullable` | Reject; complete replacement never inherits old children or fills defaults | Supply every such child, or use `[index][child]` for one child |
 | Struct `[index][age]` operand also supplies `city` | Reject; only the selected child is permitted | Supply only `age`; use a complete element to replace all children |
 | Update two of three Struct children in one request | Cannot express a proper multi-child subset with one path | Make explicit separate child requests, or supply a complete element; these are different operations |
-| Typed Array/Struct element or child replacement is `null` | Reject; replacements must be concrete, non-null values | Use a non-null value; JSON `null` is a separate contract |
-| Immediate scalar/vector operand includes element-level `valid_data` | Reject; `PATH_REPLACE` does not interpret element nullability metadata | Send the supported non-null singleton representation |
+| Typed Array/Struct element or child replacement is `null`, on a child that is not `element_nullable` | Reject; replacements must be concrete, non-null values | Use a non-null value; JSON `null` is a separate contract |
+| Immediate scalar/vector operand includes element-level `valid_data`, on a field or child that is not `element_nullable` | Reject; such a target has no element nullability | Send the supported non-null singleton representation |
 | Target or operand parent row is missing or database NULL | Reject; there is no existing container or concrete operand | Provide a present operand; use ordinary field replacement to initialize a null parent |
 | Array index is out of range, including every index into an empty array | Reject; indexing does not create elements | Initialize or resize through an ordinary whole-field replacement |
-| Nested typed Array, a nested Array child of Struct, or a standalone Struct parent | Not a supported replacement target; a full Struct replacement also fails if any child has an unsupported replacement type | A supported single-child path can preserve non-target nested Array children |
+| Nested typed Array, a nested Array child of Struct that is not `element_nullable`, or a standalone Struct parent | Not a supported replacement target; a full Struct replacement also fails if any child has an unsupported replacement type | A supported single-child path can preserve non-target nested Array children |
 | Replace a vector coordinate or traverse below a typed Struct child | Reject; typed paths stop at `[index][child]` | Replace the complete vector with the schema-required dimension |
 | JSON intermediate key is missing | Reject; for example, `{}` cannot accept `["profile"]["age"]` | Replace or create `profile` with the complete desired object |
 | JSON intermediate value is `null`, a scalar, or the wrong container type | Reject; keys require objects and indexes require arrays | Replace that intermediate value itself instead of traversing through it |
@@ -741,7 +781,8 @@ dispatch, Proxy validates:
 - aligned Struct child arrays have consistent element counts;
 - omitted nested Array children participate in alignment validation and are
   preserved unchanged; and
-- every immediate typed-Array replacement value is concrete and non-null.
+- every immediate typed-Array replacement value is concrete and non-null,
+  except an element of an `element_nullable` Struct child.
 
 ### Stage 3: post-merge validation
 
@@ -1103,8 +1144,9 @@ Unknown-enum rejection protects only older Proxies that already validate
 - `PATH_REPLACE [index]` replaces one existing scalar Array element without
   changing order or length.
 - `PATH_REPLACE [index][child]` replaces exactly one existing Struct child.
-- `PATH_REPLACE [index]` requires and replaces all Struct children; missing
-  children are rejected instead of inherited from the old element.
+- `PATH_REPLACE [index]` replaces all Struct children; a missing child that
+  is not `element_nullable` is rejected instead of inherited from the old
+  element, and a missing `element_nullable` child becomes a null element.
 - The same parent field has at most one op/path in a request; different parent
   fields may be updated together.
 - Every targeted primary key exists, every parent is not database NULL, and
@@ -1112,9 +1154,10 @@ Unknown-enum rejection protects only older Proxies that already validate
 - JSON intermediate containers must exist and have the required type; a
   missing final object key is created. Index access never expands an array,
   while replacing a selected complete JSON array may change its length.
-- Typed-Array replacement values are concrete and non-null; this feature does
-  not add element-level nullability. JSON replacement accepts JSON `null`
-  without treating it as database NULL.
+- Typed-Array replacement values are concrete and non-null, except elements of
+  an `element_nullable` Struct child; this feature does not add element-level
+  nullability. JSON replacement accepts JSON `null` without treating it as
+  database NULL.
 - Literal bracketed dynamic JSON keys are never parsed as paths.
 - Every participating SDK and REST v2 serialize the same relative path string
   and parent-specific protobuf operand: dense singleton containers for typed

@@ -241,6 +241,7 @@ func (t *alterCollectionSchemaTask) preExecuteDrop(ctx context.Context) error {
 | Field is function output | `field is referenced by function {fn} as output, drop function first` |
 | Target is the last sub-field of a struct array field | `cannot drop the last sub-field "s[b]" of struct field "s", drop the struct field instead` |
 | Every sub-field left after the drop was added after the struct was created | `cannot drop sub-field "s[a]" of struct field "s": every remaining sub-field was added after the struct was created, and segments written before that store no data for them; drop the struct field instead` |
+| Target is a struct sub-field with a protected role (primary key, auto ID, partition or clustering key, dynamic, function output, external field) | `cannot drop struct sub-field "s[b]" with a protected role` |
 | Dropping whole struct array field would leave no vector | `cannot drop struct array field {name}: it would leave no vector field in the collection` |
 
 **Struct array field scope**:
